@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="temperature-processing" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.eneas.sensors.temperature.processing.TemperatureProcessingApplication" />
+    <module name="temperature-processing.main" />
+    <option name="VM_PARAMETERS" value="-XX:MaxRAM=256m" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/microservices/temperature-processing" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>
