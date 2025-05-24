@@ -1,9 +1,9 @@
 package com.eneas.sensors.temperature.processing.domain.services;
 
+import com.eneas.sensors.temperature.processing.api.dtos.TemperatureInput;
 import com.eneas.sensors.temperature.processing.api.dtos.TemperatureOutput;
 import com.eneas.sensors.temperature.processing.commons.IdGenerator;
 import com.eneas.sensors.temperature.processing.infra.rabbitmq.RabbitMQConfig;
-import io.hypersistence.tsid.TSID;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.MessagePostProcessor;
@@ -21,22 +21,22 @@ public class TemperatureProcessingService {
 
     private final RabbitTemplate rabbitTemplate;
 
-    public void execute(TSID sensorId, String value) {
-        if (value == null || value.isBlank()) {
+    public void execute(TemperatureInput input) {
+        if (input.getValue() == null || input.getValue().isBlank()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
         }
 
         Double temperature;
 
         try {
-            temperature = Double.parseDouble(value);
+            temperature = Double.parseDouble(input.getValue());
         } catch (NumberFormatException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
         }
 
         TemperatureOutput output = TemperatureOutput.builder()
                 .id(IdGenerator.generateTimeBasedUUID())
-                .sensorId(sensorId)
+                .sensorId(input.getSensorId())
                 .value(temperature)
                 .createdAt(OffsetDateTime.now())
                 .build();
