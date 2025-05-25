@@ -7,3 +7,6 @@ spring:
     port: 5672
     username: admin
     password: admin
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/sensors
