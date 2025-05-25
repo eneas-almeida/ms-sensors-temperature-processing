@@ -3,7 +3,9 @@ package com.eneas.sensors.temperature.processing.domain.services;
 import com.eneas.sensors.temperature.processing.api.dtos.TemperatureInput;
 import com.eneas.sensors.temperature.processing.api.dtos.TemperatureOutput;
 import com.eneas.sensors.temperature.processing.commons.IdGenerator;
+import com.eneas.sensors.temperature.processing.domain.models.TemperatureProcessing;
 import com.eneas.sensors.temperature.processing.infra.rabbitmq.RabbitMQConfig;
+import com.eneas.sensors.temperature.processing.infra.repositories.TemperatureProcessingRepository;
 import io.hypersistence.tsid.TSID;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -15,6 +17,7 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
@@ -28,12 +31,15 @@ public class TemperatureProcessingService {
     // Rabbit template
     private final RabbitTemplate rabbitTemplate;
 
+    // Repository
+    private final TemperatureProcessingRepository repository;
+
     // Configurações
-    private static final int BUFFER_LIMIT = 10;
-    private static final int TIMEOUT = 5; // segundos
-    private static final int THREADS_CORE = 4;
-    private static final int THREADS_MAX = 10;
-    private static final int MAX_TAREFAS_PENDENTES = 100;
+    private static final int BUFFER_LIMIT = 10000;
+    private static final int TIMEOUT = 5;
+    private static final int THREADS_CORE = 50;
+    private static final int THREADS_MAX = 300;
+    private static final int MAX_TAREFAS_PENDENTES = 5000;
 
     // Buffer e sincronização
     private final List<TemperatureInput> buffer = new ArrayList<>();
@@ -109,14 +115,24 @@ public class TemperatureProcessingService {
     private void enviarParaMongo(List<TemperatureInput> input) {
         log.info("Enviando {} medições para o mongo", input.size());
 
+        List<TemperatureProcessing> temperatures = new ArrayList<>();
+
         for (TemperatureInput e : input) {
-            System.out.println(" - MongoDB <- " + e);
+            TemperatureProcessing temperature = TemperatureProcessing.builder()
+                    .id(IdGenerator.generateTimeBasedUUID().toString())
+                    .sensorId(e.getSensorId())
+                    .value(obtemTemperatura(e.getValue()))
+                    .createdAt(new Date())
+                    .build();
+
+            temperatures.add(temperature);
         }
 
         try {
-            Thread.sleep(3000); // simula tempo de escrita
-            System.out.println("✓ MongoDB >>>>>>>>>>>>>>>>> <- " + input.size() + " medicoes");
-        } catch (InterruptedException ignored) {
+            repository.saveAll(temperatures);
+        } catch (RuntimeException e) {
+            log.error("Erro ao salvar no MongoDB: {}", e.getMessage());
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Erro ao salvar no MongoDB");
         }
     }
 
