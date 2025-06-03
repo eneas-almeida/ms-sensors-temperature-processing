@@ -16,9 +16,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.time.OffsetDateTime;
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -28,131 +26,137 @@ import java.util.concurrent.locks.ReentrantLock;
 @RequiredArgsConstructor
 public class TemperatureProcessingService {
 
-    // Rabbit template
     private final RabbitTemplate rabbitTemplate;
-
-    // Repository
     private final TemperatureProcessingRepository repository;
 
-    // Configurações
     private static final int BUFFER_LIMIT = 10000;
     private static final int TIMEOUT = 5;
-    private static final int THREADS_CORE = 50;
-    private static final int THREADS_MAX = 300;
-    private static final int MAX_TAREFAS_PENDENTES = 5000;
 
-    // Buffer e sincronização
-    private final List<TemperatureInput> buffer = new ArrayList<>();
-    private final Lock lock = new ReentrantLock();
+    private final ExecutorService workerPool = Executors.newFixedThreadPool(100);
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(50);
 
-    // Pool para tarefas de envio para o Mongo
-    private final ExecutorService workerPool = new ThreadPoolExecutor(
-            THREADS_CORE, THREADS_MAX, 60L, TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(MAX_TAREFAS_PENDENTES),
-            new ThreadPoolExecutor.CallerRunsPolicy() // Se tudo estiver cheio, executa na thread chamadora
-    );
+    private final List<TemperatureProcessing> bufferOk = new ArrayList<>();
+    private final List<TemperatureProcessing> bufferErro = new ArrayList<>();
+    private final Lock lockOk = new ReentrantLock();
+    private final Lock lockErro = new ReentrantLock();
 
-    // Agendador para flush por timeout
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-    private ScheduledFuture<?> flushTask;
+    private ScheduledFuture<?> flushTaskOk;
+    private ScheduledFuture<?> flushTaskErro;
 
     public void execute(TemperatureInput input) {
         Double temperature = obtemTemperatura(input.getValue());
 
-        // 1. Envia para a fila
-        enviaParaFila(input.getSensorId(), temperature);
+        CompletableFuture.runAsync(() -> {
+            try {
+                enviaParaFila(input.getSensorId(), temperature);
 
+                TemperatureProcessing entity = TemperatureProcessing.builder()
+                        .id(IdGenerator.generateTimeBasedUUID().toString())
+                        .sensorId(input.getSensorId())
+                        .value(temperature)
+                        .enqueued(true)
+                        .createdAt(new Date())
+                        .build();
+
+                adicionarAoBuffer(entity, bufferOk, lockOk, true);
+
+            } catch (Exception e) {
+                log.error("Erro ao enviar para fila: {}", e.getMessage());
+
+                TemperatureProcessing entity = TemperatureProcessing.builder()
+                        .id(IdGenerator.generateTimeBasedUUID().toString())
+                        .sensorId(input.getSensorId())
+                        .value(temperature)
+                        .enqueued(false)
+                        .createdAt(new Date())
+                        .build();
+
+                adicionarAoBuffer(entity, bufferErro, lockErro, false);
+            }
+        }, workerPool);
+    }
+
+    private void adicionarAoBuffer(
+            TemperatureProcessing entity,
+            List<TemperatureProcessing> buffer,
+            Lock lock,
+            boolean sucessoEnvio
+    ) {
         lock.lock();
-
         try {
-            // 2. Adiciona no buffer
-            buffer.add(input);
+            buffer.add(entity);
 
-            // 3. Se atingiu o limite, flush imediato
             if (buffer.size() >= BUFFER_LIMIT) {
-                List<TemperatureInput> lote = new ArrayList<>(buffer);
+                List<TemperatureProcessing> lote = new ArrayList<>(buffer);
                 buffer.clear();
-                enviarLoteAsync(lote);
-
-                // Cancela flush por timeout se houver
-                if (flushTask != null && !flushTask.isDone()) {
-                    flushTask.cancel(false);
-                }
+                enviarLoteAsync(lote, sucessoEnvio);
+                cancelarFlush(sucessoEnvio);
             } else {
-                // 4. Se não atingiu limite, agenda flush por timeout
-                if (flushTask != null && !flushTask.isDone()) {
-                    flushTask.cancel(false);
-                }
-
-                flushTask = scheduler.schedule(() -> {
-                    lock.lock();
-
-                    try {
-                        if (!buffer.isEmpty()) {
-                            List<TemperatureInput> lote = new ArrayList<>(buffer);
-                            buffer.clear();
-                            enviarLoteAsync(lote);
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                }, TIMEOUT, TimeUnit.SECONDS);
+                reprogramarFlush(sucessoEnvio);
             }
         } finally {
             lock.unlock();
         }
     }
 
-    private void enviarLoteAsync(List<TemperatureInput> lote) {
-        CompletableFuture.runAsync(() -> enviarParaMongo(lote), workerPool)
-                .thenRun(() -> System.out.println("Flush concluido com " + lote.size() + " registros"))
+    private void reprogramarFlush(boolean sucessoEnvio) {
+        ScheduledFuture<?> flushTask = sucessoEnvio ? flushTaskOk : flushTaskErro;
+
+        if (flushTask != null && !flushTask.isDone()) {
+            flushTask.cancel(false);
+        }
+
+        ScheduledFuture<?> newTask = scheduler.schedule(() -> {
+            Lock lock = sucessoEnvio ? lockOk : lockErro;
+            List<TemperatureProcessing> buffer = sucessoEnvio ? bufferOk : bufferErro;
+
+            lock.lock();
+            try {
+                if (!buffer.isEmpty()) {
+                    List<TemperatureProcessing> lote = new ArrayList<>(buffer);
+                    buffer.clear();
+                    enviarLoteAsync(lote, sucessoEnvio);
+                }
+            } finally {
+                lock.unlock();
+            }
+        }, TIMEOUT, TimeUnit.SECONDS);
+
+        if (sucessoEnvio) {
+            flushTaskOk = newTask;
+        } else {
+            flushTaskErro = newTask;
+        }
+    }
+
+    private void cancelarFlush(boolean sucessoEnvio) {
+        if (sucessoEnvio && flushTaskOk != null) {
+            flushTaskOk.cancel(false);
+        } else if (!sucessoEnvio && flushTaskErro != null) {
+            flushTaskErro.cancel(false);
+        }
+    }
+
+    private void enviarLoteAsync(List<TemperatureProcessing> lote, boolean sucessoEnvio) {
+        CompletableFuture.runAsync(() -> enviarParaMongo(lote, sucessoEnvio), workerPool)
+                .thenRun(() -> log.info("Flush de {} concluído com {} registros",
+                        sucessoEnvio ? "sucesso" : "erro", lote.size()))
                 .exceptionally(ex -> {
-                    System.err.println("Erro ao enviar para Mongo: " + ex.getMessage());
+                    log.error("Erro ao salvar no Mongo: {}", ex.getMessage());
                     return null;
                 });
     }
 
-    private void enviarParaMongo(List<TemperatureInput> input) {
-        log.info("Enviando {} medições para o mongo", input.size());
-
-        List<TemperatureProcessing> temperatures = new ArrayList<>();
-
-        for (TemperatureInput e : input) {
-            TemperatureProcessing temperature = TemperatureProcessing.builder()
-                    .id(IdGenerator.generateTimeBasedUUID().toString())
-                    .sensorId(e.getSensorId())
-                    .value(obtemTemperatura(e.getValue()))
-                    .createdAt(new Date())
-                    .build();
-
-            temperatures.add(temperature);
-        }
-
+    private void enviarParaMongo(List<TemperatureProcessing> lote, boolean sucessoEnvio) {
         try {
-            repository.saveAll(temperatures);
+            repository.saveAll(lote);
         } catch (RuntimeException e) {
-            log.error("Erro ao salvar no MongoDB: {}", e.getMessage());
+            log.error("Erro ao salvar lote [{}] no MongoDB: {}", sucessoEnvio ? "sucesso" : "erro", e.getMessage());
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Erro ao salvar no MongoDB");
         }
     }
 
-    private Double obtemTemperatura(String value) {
-        if (value == null || value.isBlank()) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
-        }
-
-        Double temperature;
-
-        try {
-            temperature = Double.parseDouble(value);
-        } catch (NumberFormatException e) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
-        }
-
-        return temperature;
-    }
-
-    public void enviaParaFila(TSID sensorId, Double temperature) {
+    private void enviaParaFila(TSID sensorId, Double temperature) {
         TemperatureOutput output = TemperatureOutput.builder()
                 .id(IdGenerator.generateTimeBasedUUID())
                 .sensorId(sensorId)
@@ -160,17 +164,28 @@ public class TemperatureProcessingService {
                 .createdAt(OffsetDateTime.now())
                 .build();
 
-        log.info(output.toString());
+        log.info("Enviando para fila: {}", output);
 
         String exchange = RabbitMQConfig.FANOUT_EXCHANGE_NAME;
         String routingKey = "";
-        Object payload = output;
 
         MessagePostProcessor messagePostProcessor = message -> {
-            message.getMessageProperties().setHeader("sensorId", output.getSensorId().toString());
+            message.getMessageProperties().setHeader("sensorId", sensorId.toString());
             return message;
         };
 
-        rabbitTemplate.convertAndSend(exchange, routingKey, payload, messagePostProcessor);
+        rabbitTemplate.convertAndSend(exchange, routingKey, output, messagePostProcessor);
+    }
+
+    private Double obtemTemperatura(String value) {
+        if (value == null || value.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
+        }
+
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
+        }
     }
 }

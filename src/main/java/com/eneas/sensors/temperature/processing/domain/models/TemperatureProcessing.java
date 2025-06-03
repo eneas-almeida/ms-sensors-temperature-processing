@@ -22,5 +22,7 @@ public class TemperatureProcessing {
 
     private Double value;
 
+    private Boolean enqueued;
+
     private Date createdAt;
 }
